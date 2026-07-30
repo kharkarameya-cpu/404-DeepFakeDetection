@@ -1,0 +1,28 @@
+name: Discord Activity Feed
+
+on:
+  push:
+  pull_request:
+  issues:
+    types: [opened, closed, reopened]
+  issue_comment:
+  release:
+    types: [published]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Discord notification
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_ACTIVITY_WEBHOOK }}
+        run: |
+          EVENT="${{ github.event_name }}"
+          REPO="${{ github.repository }}"
+          ACTOR="${{ github.actor }}"
+          URL="${{ github.server_url }}/${{ github.repository }}"
+
+          curl -H "Content-Type: application/json" \
+          -d "{\"content\":\"📢 **${EVENT}** in **${REPO}** by **${ACTOR}**\n${URL}\"}" \
+          "$WEBHOOK"
