@@ -1,0 +1,26 @@
+# Deep Learning
+torch>=2.7.0
+torchvision>=0.22.0
+timm>=1.0.19
+
+# Computer Vision
+opencv-python>=4.10.0
+mediapipe>=0.10.14
+Pillow>=10.4.0
+
+# Numerical Computing
+numpy>=2.1.0
+scipy>=1.15.0
+
+# Data Handling
+pandas>=2.3.0
+
+# Machine Learning
+scikit-learn>=1.7.0
+
+# Visualization
+matplotlib>=3.10.0
+
+# Utilities
+tqdm>=4.67.0
+PyYAML>=6.0.2
