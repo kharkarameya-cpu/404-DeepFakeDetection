@@ -1,10 +1,46 @@
-- name: Test Discord Webhook
-  env:
-    WEBHOOK: ${{ secrets.DISCORD_ACTIVITY_WEBHOOK }}
-  run: |
-    echo "Webhook length: ${#WEBHOOK}"
+name: Discord Activity Feed
 
-    curl \
-      -H "Content-Type: application/json" \
-      --data '{"content":"✅ GitHub Actions test"}' \
-      "$WEBHOOK"
+on:
+  push:
+  pull_request:
+  issues:
+    types:
+      - opened
+      - closed
+      - reopened
+  issue_comment:
+  release:
+    types:
+      - published
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Discord notification
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_ACTIVITY_WEBHOOK }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "Discord webhook secret is empty."
+            exit 1
+          fi
+
+          EVENT="${{ github.event_name }}"
+          REPO="${{ github.repository }}"
+          ACTOR="${{ github.actor }}"
+          URL="${{ github.server_url }}/${{ github.repository }}"
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "content": "📢 **${EVENT}** in **${REPO}** by **${ACTOR}**\n${URL}"
+          }
+          EOF
+          )
+
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$WEBHOOK"
