@@ -20,6 +20,8 @@ from src.preprocessing import (
     AlignmentConfig,
     MediaPipeFaceDetector,
     FaceBox,
+    FrameStore,
+    StoreConfig,
 )
 
 
@@ -81,7 +83,7 @@ class TestFaceBox:
 
 
 class TestPipelineStructure:
-    """Test that the pipeline creates the right directory structure."""
+    """Test that the pipeline creates the right output layout."""
 
     def test_process_video_creates_output(self):
         """Creates a synthetic video, runs pipeline, checks output layout."""
@@ -103,7 +105,6 @@ class TestPipelineStructure:
             # Check output directory structure
             video_out = output_dir / "test_video"
             assert video_out.exists()
-            assert (video_out / "faces").exists()
             assert (video_out / "metadata.json").exists()
 
             # Check metadata content
@@ -112,13 +113,44 @@ class TestPipelineStructure:
             assert meta["video"] == str(video_path)
             assert len(meta["frames"]) == result.num_frames_extracted
 
+    def test_process_video_hdf5_store(self):
+        """With HDF5 store enabled, frames+faces go into a single .h5 file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "h5_test.mp4"
+            _create_synthetic_video(str(video_path), num_frames=6, fps=10)
+
+            config = PipelineConfig(use_hdf5_store=True)
+            result = process_video(str(video_path), str(tmpdir), config=config)
+
+            h5_path = result.output_dir / f"{result.video_path.stem}.h5"
+            assert h5_path.exists()
+
+            # The store should contain all extracted frames
+            with FrameStore(h5_path) as store:
+                assert store.num_frames == result.num_frames_extracted
+                assert store.get_frames().shape[0] == result.num_frames_extracted
+
+    def test_process_video_no_hdf5_jpeg_fallback(self):
+        """With HDF5 disabled, frames/faces dirs are created as JPEGs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "jpeg_test.mp4"
+            _create_synthetic_video(str(video_path), num_frames=4, fps=10)
+
+            config = PipelineConfig(use_hdf5_store=False)
+            result = process_video(str(video_path), str(tmpdir), config=config)
+
+            video_out = result.output_dir
+            assert (video_out / "frames").exists()
+            assert (video_out / "faces").exists()
+            assert not (video_out / f"{video_path.stem}.h5").exists()
+
     def test_process_video_no_frames_flag(self):
-        """When save_frames=False, frame dir should not exist."""
+        """When save_frames=False, no standalone frame dir is kept."""
         with tempfile.TemporaryDirectory() as tmpdir:
             video_path = Path(tmpdir) / "no_frames_test.mp4"
             _create_synthetic_video(str(video_path), num_frames=5, fps=10)
 
-            config = PipelineConfig(save_frames=False)
+            config = PipelineConfig(save_frames=False, use_hdf5_store=False)
             result = process_video(str(video_path), str(tmpdir), config=config)
 
             video_out = result.output_dir
@@ -139,6 +171,58 @@ class TestPipelineStructure:
             assert len(results) == 2
 
 
+class TestFrameStore:
+    """Tests for the HDF5-backed store."""
+
+    def test_add_and_read(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "store.h5"
+            frame = np.zeros((64, 64, 3), dtype=np.uint8)
+            face = np.zeros((299, 299, 3), dtype=np.uint8)
+            box = FaceBox(x=5, y=10, width=50, height=60, confidence=0.9)
+
+            with FrameStore(path) as store:
+                store.add_frame(frame)
+                store.add_frame(np.full((64, 64, 3), 128, dtype=np.uint8))
+                store.add_face(face, bbox=box, frame_idx=0, confidence=0.9)
+
+            with FrameStore(path) as store:
+                assert store.num_frames == 2
+                assert store.num_faces == 1
+                assert store.get_frames().shape == (2, 64, 64, 3)
+                assert store.get_faces().shape == (1, 299, 299, 3)
+                assert store.get_frame_map()[0] == 0
+                assert list(store.get_bboxes()[0]) == [5, 10, 50, 60]
+                assert store.get_confidences()[0] == 0.9
+
+    def test_buffered_flush(self):
+        """Many small appends should be buffered and flushed correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "buf.h5"
+            frame = np.zeros((32, 32, 3), dtype=np.uint8)
+            cfg = StoreConfig(buffer_size=8)
+
+            with FrameStore(path, config=cfg) as store:
+                for i in range(25):
+                    store.add_frame(np.full_like(frame, i, dtype=np.uint8))
+
+            with FrameStore(path) as store:
+                assert store.num_frames == 25
+                frames = store.get_frames()
+                assert frames.shape == (25, 32, 32, 3)
+                assert frames[24, 0, 0, 0] == 24
+
+    def test_attrs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "attr.h5"
+            with FrameStore(path) as store:
+                store.set_attrs({"video_path": "x.mp4", "num_faces": 3})
+            with FrameStore(path) as store:
+                attrs = store.get_attrs()
+                assert attrs["video_path"] == "x.mp4"
+                assert attrs["num_faces"] == 3
+
+
 def test_pipeline_config_serialization():
     """PipelineConfig should serialize to dict correctly."""
     config = PipelineConfig(
@@ -153,16 +237,25 @@ def test_pipeline_config_serialization():
             "enhance_blurry_frames": True,
             "jpeg_quality": 95,
         },
-            "alignment": {
-                "output_size": 299,
-                "margin_fraction": 0.25,
-                "min_landmark_confidence": 0.5,
-                "min_tracking_confidence": 0.5,
-            },
+        "alignment": {
+            "output_size": 299,
+            "margin_fraction": 0.25,
+            "min_landmark_confidence": 0.5,
+            "min_tracking_confidence": 0.5,
+        },
         "face_detection_min_confidence": 0.8,
+        "model_selection": 1,
         "save_frames": True,
         "save_faces": True,
         "skip_frames_no_face": True,
+        "use_hdf5_store": True,
+        "store_config": {
+            "compression": "gzip",
+            "compression_opts": 4,
+            "chunk_rows": 64,
+            "max_frames": 10000,
+            "buffer_size": 32,
+        },
     }
 
     from dataclasses import asdict

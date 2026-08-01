@@ -1,6 +1,7 @@
 from .face_detector import MediaPipeFaceDetector, FaceBox, get_default_detector
 from .face_alignment import FaceAligner, AlignmentConfig
 from .frame_extractor import FrameExtractor, FrameExtractionConfig, extract_frames
+from .frame_store import FrameStore, StoreConfig
 from .preprocess_video import VideoPreprocessor, PipelineConfig, ProcessedFrame, VideoResult, process_video, process_directory
 from .utils import (
     PathLike,
@@ -25,6 +26,8 @@ __all__ = [
     "FrameExtractor",
     "FrameExtractionConfig",
     "extract_frames",
+    "FrameStore",
+    "StoreConfig",
     "VideoPreprocessor",
     "PipelineConfig",
     "ProcessedFrame",

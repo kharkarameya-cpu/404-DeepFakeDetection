@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Data — raw videos and generated outputs (re-created by the pipeline)
+data/raw/**/*.mp4
+data/raw/**/*.avi
+data/raw/**/*.mov
+data/raw/**/*.mkv
+data/processed/
+data/metadata/
+*.h5
+
+# MediaPipe models are auto-downloaded on first use
+src/preprocessing/models/*.tflite
+src/preprocessing/models/*.task
+
+# Docs artifacts
+docs/*.docx

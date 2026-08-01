@@ -10,11 +10,17 @@ from .utils import ensure_model_asset, get_logger
 
 logger = get_logger(__name__)
 
-_BLAZEFACE_MODEL_URL = (
+_SHORT_RANGE_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_detector/"
     "blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
 )
-_BLAZEFACE_MODEL_FILENAME = "blaze_face_short_range.tflite"
+_SHORT_RANGE_FILENAME = "blaze_face_short_range.tflite"
+
+_FULL_RANGE_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/"
+    "blaze_face_full_range/float16/latest/blaze_face_full_range.tflite"
+)
+_FULL_RANGE_FILENAME = "blaze_face_full_range.tflite"
 
 
 @dataclass
@@ -45,9 +51,23 @@ class BaseFaceDetector(ABC):
 
 
 class MediaPipeFaceDetector(BaseFaceDetector):
-    """Face detector backed by MediaPipe Tasks API (v1.0+)."""
+    """Face detector backed by MediaPipe Tasks API (v1.0+).
 
-    def __init__(self, min_confidence: float = 0.5, model_selection: int = 1):
+    Args:
+        model_selection: 0 = short-range model (selfies, face within ~2m);
+            1 = full-range model (arbitrary video, faces further away).
+            Default 1, which is better suited to video footage.
+        min_confidence: Minimum detection confidence to keep a box.
+        fallback_to_other_model: If the selected model finds nothing, retry
+            with the other BlazeFace model before giving up.
+    """
+
+    def __init__(
+        self,
+        min_confidence: float = 0.5,
+        model_selection: int = 1,
+        fallback_to_other_model: bool = True,
+    ):
         try:
             import mediapipe as mp
         except ImportError as exc:
@@ -56,27 +76,44 @@ class MediaPipeFaceDetector(BaseFaceDetector):
                 "Install with: pip install mediapipe"
             ) from exc
 
-        model_url = (
-            _BLAZEFACE_MODEL_URL
-        )
-        model_path = ensure_model_asset(model_url, _BLAZEFACE_MODEL_FILENAME)
+        self._mp = mp
+        self.min_confidence = min_confidence
+        self.model_selection = model_selection
+        self.fallback_to_other_model = fallback_to_other_model
 
-        options = mp.tasks.vision.FaceDetectorOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        self._detector = self._create_detector(model_selection, min_confidence)
+        self._fallback_detector = None
+        if fallback_to_other_model:
+            other = 0 if model_selection == 1 else 1
+            self._fallback_detector = self._create_detector(other, min_confidence)
+
+    def _create_detector(self, model_selection: int, min_confidence: float):
+        if model_selection == 1:
+            model_path = ensure_model_asset(_FULL_RANGE_URL, _FULL_RANGE_FILENAME)
+        else:
+            model_path = ensure_model_asset(_SHORT_RANGE_URL, _SHORT_RANGE_FILENAME)
+
+        options = self._mp.tasks.vision.FaceDetectorOptions(
+            base_options=self._mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+            running_mode=self._mp.tasks.vision.RunningMode.IMAGE,
             min_detection_confidence=min_confidence,
         )
-        self._detector = mp.tasks.vision.FaceDetector.create_from_options(options)
-        self.min_confidence = min_confidence
+        return self._mp.tasks.vision.FaceDetector.create_from_options(options)
 
     def detect(self, image: np.ndarray) -> List[FaceBox]:
-        import mediapipe as mp
+        boxes = self._run_detector(self._detector, image)
+        if not boxes and self._fallback_detector is not None:
+            logger.debug("Primary face model found nothing; trying fallback model.")
+            boxes = self._run_detector(self._fallback_detector, image)
+        return boxes
+
+    def _run_detector(self, detector, image: np.ndarray) -> List[FaceBox]:
         import cv2
 
         h, w = image.shape[:2]
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        results = self._detector.detect(mp_image)
+        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        results = detector.detect(mp_image)
 
         boxes: List[FaceBox] = []
         if not results.detections:
@@ -99,6 +136,8 @@ class MediaPipeFaceDetector(BaseFaceDetector):
 
     def close(self) -> None:
         self._detector.close()
+        if self._fallback_detector is not None:
+            self._fallback_detector.close()
 
     def __enter__(self) -> "MediaPipeFaceDetector":
         return self

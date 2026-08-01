@@ -18,6 +18,7 @@ Usage (Python):
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional
@@ -28,9 +29,12 @@ import numpy as np
 from .face_alignment import FaceAligner, AlignmentConfig
 from .face_detector import MediaPipeFaceDetector, FaceBox
 from .frame_extractor import FrameExtractor, FrameExtractionConfig
+from .frame_store import FrameStore, StoreConfig
 from .utils import PathLike, ensure_dir, get_logger, resize_with_pad
 
 logger = get_logger(__name__)
+
+_nullcontext = nullcontext
 
 
 @dataclass
@@ -38,15 +42,20 @@ class PipelineConfig:
     frame_extraction: FrameExtractionConfig = None
     alignment: AlignmentConfig = None
     face_detection_min_confidence: float = 0.5
+    model_selection: int = 1          # 0 = short-range (selfie), 1 = full-range (video)
     save_frames: bool = True
     save_faces: bool = True
     skip_frames_no_face: bool = True
+    use_hdf5_store: bool = True       # store frames/faces in one .h5 file instead of JPEGs
+    store_config: StoreConfig = None
 
     def __post_init__(self):
         if self.frame_extraction is None:
             self.frame_extraction = FrameExtractionConfig()
         if self.alignment is None:
             self.alignment = AlignmentConfig()
+        if self.store_config is None:
+            self.store_config = StoreConfig()
 
 
 @dataclass
@@ -73,7 +82,8 @@ class VideoPreprocessor:
         self.config = config or PipelineConfig()
         self._frame_extractor = FrameExtractor(self.config.frame_extraction)
         self._face_detector = MediaPipeFaceDetector(
-            min_confidence=self.config.face_detection_min_confidence
+            min_confidence=self.config.face_detection_min_confidence,
+            model_selection=self.config.model_selection,
         )
         self._face_aligner = FaceAligner(self.config.alignment)
 
@@ -88,38 +98,57 @@ class VideoPreprocessor:
 
         frames_dir = ensure_dir(video_output / "frames") if self.config.save_frames else None
         faces_dir = ensure_dir(video_output / "faces") if self.config.save_faces else None
+        store_path = video_output / f"{video_stem}.h5" if self.config.use_hdf5_store else None
 
-        frame_paths = self._frame_extractor.extract(video_path, frames_dir or (video_output / "_frames_tmp"))
+        frame_paths = self._frame_extractor.extract(
+            video_path, frames_dir or (video_output / "_frames_tmp")
+        )
 
         processed_frames: List[ProcessedFrame] = []
         num_faces = 0
 
-        for i, frame_path in enumerate(frame_paths):
-            frame = cv2.imread(str(frame_path))
-            if frame is None:
-                continue
+        with FrameStore(store_path) if store_path else _nullcontext() as store:
+            for i, frame_path in enumerate(frame_paths):
+                frame = cv2.imread(str(frame_path))
+                if frame is None:
+                    continue
 
-            face_box = self._face_detector.detect_primary(frame)
-            face_path = None
+                if store is not None:
+                    frame_idx = store.add_frame(frame)
+                else:
+                    frame_idx = None
 
-            if face_box is not None:
-                aligned = self._face_aligner.align_and_crop(frame, face_box)
-                if aligned is not None and faces_dir is not None:
-                    face_path = faces_dir / f"face_{i+1:04d}.jpg"
-                    cv2.imwrite(str(face_path), aligned, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    num_faces += 1
-                elif not self.config.skip_frames_no_face:
-                    aligned = resize_with_pad(frame, target_size=self.config.alignment.output_size)
-                    if faces_dir is not None:
-                        face_path = faces_dir / f"face_{i+1:04d}.jpg"
-                        cv2.imwrite(str(face_path), aligned, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                face_box = self._face_detector.detect_primary(frame)
+                face_path = None
 
-            processed_frames.append(ProcessedFrame(
-                frame_path=frame_path if frames_dir else None,
-                face_path=face_path,
-                face_box=face_box,
-                has_face=face_box is not None,
-            ))
+                if face_box is not None:
+                    aligned = self._face_aligner.align_and_crop(frame, face_box)
+                    if aligned is not None:
+                        if store is not None:
+                            store.add_face(aligned, bbox=face_box, frame_idx=frame_idx,
+                                           confidence=face_box.confidence)
+                        elif faces_dir is not None:
+                            face_path = faces_dir / f"face_{i+1:04d}.jpg"
+                            cv2.imwrite(str(face_path), aligned, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        num_faces += 1
+                    elif not self.config.skip_frames_no_face:
+                        aligned = resize_with_pad(frame, target_size=self.config.alignment.output_size)
+                        if store is not None:
+                            store.add_face(aligned, bbox=face_box, frame_idx=frame_idx,
+                                           confidence=face_box.confidence)
+                        elif faces_dir is not None:
+                            face_path = faces_dir / f"face_{i+1:04d}.jpg"
+                            cv2.imwrite(str(face_path), aligned, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+                processed_frames.append(ProcessedFrame(
+                    frame_path=frame_path if frames_dir else None,
+                    face_path=face_path,
+                    face_box=face_box,
+                    has_face=face_box is not None,
+                ))
+
+        if store_path is not None:
+            self._save_store_attrs(store_path, video_path, len(frame_paths))
 
         if not self.config.save_frames and frames_dir is None:
             _tmp = video_output / "_frames_tmp"
@@ -141,6 +170,18 @@ class VideoPreprocessor:
             video_path.name, result.num_frames_extracted, result.num_faces_detected
         )
         return result
+
+    def _save_store_attrs(self, store_path: Path, video_path: Path, n_frames: int) -> None:
+        with FrameStore(store_path) as store:
+            store.set_attrs({
+                "video_path": str(video_path),
+                "num_frames": n_frames,
+                "num_faces": store.num_faces,
+                "frame_extraction": repr(self.config.frame_extraction),
+                "alignment": repr(self.config.alignment),
+                "face_detection_min_confidence": self.config.face_detection_min_confidence,
+                "model_selection": self.config.model_selection,
+            })
 
     def _save_metadata(self, result: VideoResult, output_dir: Path) -> None:
         meta = {
@@ -210,12 +251,20 @@ if __name__ == "__main__":
     parser.add_argument("--fps", type=float, default=7.5, help="Target frame sampling rate.")
     parser.add_argument("--no-frames", action="store_true", help="Don't save intermediate frames.")
     parser.add_argument("--no-faces", action="store_true", help="Don't save aligned face crops.")
+    parser.add_argument("--no-h5", action="store_true", help="Use JPEG files instead of HDF5 store.")
+    parser.add_argument("--model-selection", type=int, choices=[0, 1], default=1,
+                        help="0=short-range (selfie), 1=full-range (video).")
+    parser.add_argument("--min-confidence", type=float, default=0.5,
+                        help="Minimum face detection confidence.")
     args = parser.parse_args()
 
     config = PipelineConfig(
         frame_extraction=FrameExtractionConfig(target_fps=args.fps),
         save_frames=not args.no_frames,
         save_faces=not args.no_faces,
+        use_hdf5_store=not args.no_h5,
+        model_selection=args.model_selection,
+        face_detection_min_confidence=args.min_confidence,
     )
     result = process_video(args.video, args.output_dir, config)
     print(f"Done — {result.num_faces_detected} faces from {result.num_frames_extracted} frames.")
