@@ -8,6 +8,9 @@ opencv-python>=4.10.0
 mediapipe>=0.10.14
 Pillow>=10.4.0
 
+# Storage
+h5py>=3.10.0
+
 # Numerical Computing
 numpy>=2.1.0
 scipy>=1.15.0
