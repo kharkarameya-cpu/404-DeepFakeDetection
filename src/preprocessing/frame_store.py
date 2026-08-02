@@ -69,6 +69,7 @@ class FrameStore:
         path: PathLike,
         config: Optional[StoreConfig] = None,
         max_faces: int = 10000,
+        overwrite: bool = False,
     ):
         if h5py is None:
             raise ImportError(
@@ -80,7 +81,11 @@ class FrameStore:
         self.config = config or StoreConfig()
         self.max_faces = max_faces
 
-        self._f = h5py.File(str(self.path), "a")
+        # ``overwrite=True`` truncates any pre-existing store so re-running the
+        # pipeline on the same video doesn't stack duplicate frames/faces on top
+        # of the previous run (which would otherwise look like duplicates).
+        file_mode = "w" if overwrite else "a"
+        self._f = h5py.File(str(self.path), file_mode)
         self._frames = self._init_dataset(
             "frames/img",
             shape=(0,) + (0, 0, 3),

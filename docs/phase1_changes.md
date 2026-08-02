@@ -1,5 +1,37 @@
 # Phase 1 — Preprocessing Pipeline
 
+## Frame Selection Pipeline (New)
+
+Storage-efficient keyframe selection so the AI detector only runs on a handful of representative frames:
+
+```
+Video → Ring Buffer → HashSet (dHash dedup) → LSH → Scene Graph → Representative Frames → AI Detector
+```
+
+### `src/preprocessing/frame_selection.py`
+**New** — streaming frame selector.
+
+- `dhash()` / `hamming_distance()` — perceptual hashing; near-duplicate frames collapse to one (static talking heads → 1 frame).
+- `RingBuffer` — bounded streaming window (only recent frames kept in memory).
+- `feature_vector()` — 8×8 RGB grid (192-d), intentionally **not** L2-normalised; similarity is distance-based (`_sim = exp(-mean_abs_diff * 4)`).
+- `LSHIndex` — random-hyperplane LSH to find *similar non-adjacent* frames (e.g. camera returning to an earlier scene).
+- `SceneGraph` — union-find over temporal + LSH edges; connected components = scenes.
+- `FrameSelector` — `push(frame, video_frame_idx)` streaming API; `representatives()` returns the sharpest frame per scene, capped by `max_scenes`.
+- `select_frames_from_video()` — convenience for one-shot selection.
+
+`FrameSelectionConfig` defaults: hash_size=8, dedup_hamming=10, dedup_window=64, feature_dim=192, lsh_num_tables=4, lsh_num_projections=8, similarity_threshold=0.80, temporal_threshold=0.75, max_scenes=50, min_scene_frames=2.
+
+### `src/preprocessing/preprocess_video.py` (modified)
+- `PipelineConfig` gained `use_scene_selection: bool = True` and `selection_config: FrameSelectionConfig`.
+- `process()` now streams the video through the `FrameSelector`, then runs face detection/alignment **only on representative frames** (re-read from the video by index). Legacy "process every frame" path still available via `use_scene_selection=False`.
+
+**Result on the real 175 MB test video:** 13,681 frames sampled → 19 deduped → 4 representative scenes → 4 frames processed, 3 faces detected (vs ~4,560 frames in the old path).
+
+### `tests/test_pipeline.py`
+7 new frame-selection tests (dhash/hamming, ring-buffer eviction, LSH, static-scene collapse, distinct-scene separation, similar-scene merge, pipeline stores reps only) → **23 tests total, all passing**.
+
+---
+
 ## Files Created
 
 ### `src/preprocessing/preprocess_video.py`

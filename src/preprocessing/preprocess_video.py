@@ -29,8 +29,12 @@ import numpy as np
 from .face_alignment import FaceAligner, AlignmentConfig
 from .face_detector import MediaPipeFaceDetector, FaceBox
 from .frame_extractor import FrameExtractor, FrameExtractionConfig
+from .frame_selection import FrameSelector, FrameSelectionConfig
 from .frame_store import FrameStore, StoreConfig
-from .utils import PathLike, ensure_dir, get_logger, resize_with_pad
+from .utils import (
+    PathLike, ensure_dir, get_logger, open_video_capture, resize_with_pad,
+    sample_frames,
+)
 
 logger = get_logger(__name__)
 
@@ -48,6 +52,8 @@ class PipelineConfig:
     skip_frames_no_face: bool = True
     use_hdf5_store: bool = True       # store frames/faces in one .h5 file instead of JPEGs
     store_config: StoreConfig = None
+    use_scene_selection: bool = True  # RingBuffer → dedup → LSH → scene graph → representatives
+    selection_config: FrameSelectionConfig = None
 
     def __post_init__(self):
         if self.frame_extraction is None:
@@ -56,6 +62,8 @@ class PipelineConfig:
             self.alignment = AlignmentConfig()
         if self.store_config is None:
             self.store_config = StoreConfig()
+        if self.selection_config is None:
+            self.selection_config = FrameSelectionConfig()
 
 
 @dataclass
@@ -100,16 +108,82 @@ class VideoPreprocessor:
         faces_dir = ensure_dir(video_output / "faces") if self.config.save_faces else None
         store_path = video_output / f"{video_stem}.h5" if self.config.use_hdf5_store else None
 
+        if self.config.use_scene_selection:
+            # New pipeline: stream through selector, only store + run AI on reps.
+            reps = self._select_representatives(video_path)
+            rep_frames = self._read_representatives(video_path, reps)
+            result = self._process_frames(video_path, video_output, rep_frames,
+                                          frames_dir, faces_dir, store_path, len(rep_frames))
+            logger.info(
+                "Processed %s: %d representative frames (of %d sampled), %d faces detected",
+                video_path.name, len(rep_frames), len(reps), result.num_faces_detected
+            )
+            return result
+
+        # Legacy path: extract all frames, process every one.
         frame_paths = self._frame_extractor.extract(
             video_path, frames_dir or (video_output / "_frames_tmp")
         )
+        frames = [cv2.imread(str(p)) for p in frame_paths if cv2.imread(str(p)) is not None]
+        result = self._process_frames(video_path, video_output, frames,
+                                      frames_dir, faces_dir, store_path, len(frame_paths))
 
+        if not self.config.save_frames and frames_dir is None:
+            _tmp = video_output / "_frames_tmp"
+            if _tmp.exists():
+                import shutil
+                shutil.rmtree(_tmp)
+
+        logger.info(
+            "Processed %s: %d frames, %d faces detected",
+            video_path.name, result.num_frames_extracted, result.num_faces_detected
+        )
+        return result
+
+    # ------------------------------------------------------------------ #
+    def _select_representatives(self, video_path: Path) -> list:
+        """Stream the video through the FrameSelector and return the list of
+        representative frames (sharpest frame per scene)."""
+        selector = FrameSelector(self.config.selection_config)
+        target_fps = self.config.frame_extraction.target_fps
+        preview_width = self.config.selection_config.preview_width
+
+        n_sampled = 0
+        # sample_frames prefers FFmpeg (fast, hardware-friendly decode + downscale)
+        # and falls back to a pure-OpenCV scanner if FFmpeg is unavailable.
+        for video_frame_idx, small_frame in sample_frames(video_path, target_fps, preview_width):
+            selector.push(small_frame, video_frame_idx)
+            n_sampled += 1
+
+        logger.info(
+            "%s: %d frames sampled -> %d accepted after dedup -> %d representative scenes",
+            video_path.name, n_sampled, selector.num_accepted,
+            len(selector.representatives()),
+        )
+        return selector.representatives()
+
+    def _read_representatives(self, video_path: Path, reps) -> list:
+        """Read the actual representative frames back from the video."""
+        cap = open_video_capture(video_path)
+        frames = []
+        try:
+            for rep in reps:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, rep.video_frame_idx)
+                ret, frame = cap.read()
+                if ret:
+                    frames.append(frame)
+        finally:
+            cap.release()
+        return frames
+
+    def _process_frames(self, video_path, video_output, frames,
+                        frames_dir, faces_dir, store_path, n_extracted) -> VideoResult:
+        """Run face detection + alignment on the given frames and store results."""
         processed_frames: List[ProcessedFrame] = []
         num_faces = 0
 
-        with FrameStore(store_path) if store_path else _nullcontext() as store:
-            for i, frame_path in enumerate(frame_paths):
-                frame = cv2.imread(str(frame_path))
+        with (FrameStore(store_path, overwrite=True) if store_path else _nullcontext()) as store:
+            for i, frame in enumerate(frames):
                 if frame is None:
                     continue
 
@@ -140,35 +214,29 @@ class VideoPreprocessor:
                             face_path = faces_dir / f"face_{i+1:04d}.jpg"
                             cv2.imwrite(str(face_path), aligned, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
+                frame_path = None
+                if frames_dir is not None:
+                    frame_path = frames_dir / f"frame_{i+1:04d}.jpg"
+                    cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
                 processed_frames.append(ProcessedFrame(
-                    frame_path=frame_path if frames_dir else None,
+                    frame_path=frame_path,
                     face_path=face_path,
                     face_box=face_box,
                     has_face=face_box is not None,
                 ))
 
         if store_path is not None:
-            self._save_store_attrs(store_path, video_path, len(frame_paths))
-
-        if not self.config.save_frames and frames_dir is None:
-            _tmp = video_output / "_frames_tmp"
-            if _tmp.exists():
-                import shutil
-                shutil.rmtree(_tmp)
+            self._save_store_attrs(store_path, video_path, n_extracted)
 
         result = VideoResult(
             video_path=video_path,
-            num_frames_extracted=len(frame_paths),
+            num_frames_extracted=n_extracted,
             num_faces_detected=num_faces,
             frames=processed_frames,
             output_dir=video_output,
         )
-
         self._save_metadata(result, video_output)
-        logger.info(
-            "Processed %s: %d frames, %d faces detected",
-            video_path.name, result.num_frames_extracted, result.num_faces_detected
-        )
         return result
 
     def _save_store_attrs(self, store_path: Path, video_path: Path, n_frames: int) -> None:

@@ -19,6 +19,12 @@ data/raw/**/*.mp4
 data/raw/**/*.avi
 data/raw/**/*.mov
 data/raw/**/*.mkv
+data/raw/**/*.webm
+data/raw/**/*.jpg
+data/raw/**/*.jpeg
+data/raw/**/*.png
+data/raw/**/*.bmp
+data/raw/**/*.json
 data/processed/
 data/metadata/
 *.h5
@@ -29,3 +35,8 @@ src/preprocessing/models/*.task
 
 # Docs artifacts
 docs/*.docx
+
+# Build artifacts
+dist/
+build/
+*.spec

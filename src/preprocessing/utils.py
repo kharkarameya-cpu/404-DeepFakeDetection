@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Union
 
@@ -73,7 +76,26 @@ def list_videos(directory: PathLike, extensions=(".mp4", ".avi", ".mov", ".mkv")
 # and face landmarking) requires downloading small .tflite / .task model
 # files rather than bundling them in the package. This helper caches them
 # locally on first use so subsequent runs don't re-download.
-_MODEL_CACHE_DIR = Path(__file__).resolve().parent / "models"
+#
+# When frozen into an .exe (PyInstaller), ``__file__`` points at the temporary
+# extraction dir, so we keep the cache in a user-writable location instead and
+# seed it from the bundled copy shipped inside the executable.
+def _get_model_cache_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+        return base / "DeepFakeDetector" / "models"
+    return Path(__file__).resolve().parent / "models"
+
+
+def _seed_from_bundle(filename: str, dest: Path) -> bool:
+    """Copy a model that was bundled inside the frozen executable (if any)."""
+    if not getattr(sys, "frozen", False):
+        return False
+    bundled = Path(getattr(sys, "_MEIPASS", "")) / "models" / filename
+    if bundled.exists() and bundled.stat().st_size > 0:
+        shutil.copy2(bundled, dest)
+        return True
+    return False
 
 
 def ensure_model_asset(url: str, filename: str) -> Path:
@@ -86,10 +108,16 @@ def ensure_model_asset(url: str, filename: str) -> Path:
     """
     import urllib.request
 
-    ensure_dir(_MODEL_CACHE_DIR)
-    dest = _MODEL_CACHE_DIR / filename
+    cache_dir = _get_model_cache_dir()
+    ensure_dir(cache_dir)
+    dest = cache_dir / filename
 
     if dest.exists() and dest.stat().st_size > 0:
+        return dest
+
+    if _seed_from_bundle(filename, dest):
+        logger = get_logger("utils.ensure_model_asset")
+        logger.info("Using bundled model asset: %s -> %s", filename, dest)
         return dest
 
     logger = get_logger("utils.ensure_model_asset")
@@ -102,10 +130,120 @@ def ensure_model_asset(url: str, filename: str) -> Path:
         raise RuntimeError(
             f"Failed to download required MediaPipe model asset from {url}. "
             "This requires internet access on first run (models are cached "
-            f"locally afterwards under {_MODEL_CACHE_DIR})."
+            f"locally afterwards under {cache_dir})."
         ) from exc
 
     return dest
+
+
+def open_video_capture(path: PathLike):
+    """Open a video for reading, preferring a hardware-accelerated (NVDEC)
+    decode backend when the OpenCV build supports it.
+
+    Software frame-by-frame decoding of a long video is the dominant cost in the
+    selection pass, so enabling ``VIDEO_ACCELERATION_ANY`` (which lets OpenCV use
+    a GPU decode surface) typically yields a large speedup with no code changes
+    downstream. Falls back gracefully if the backend/flag is unavailable.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(str(path), getattr(cv2, "CAP_FFMPEG", cv2.CAP_ANY))
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(str(path))
+    if cap.isOpened():
+        try:
+            cap.set(cv2.CAP_PROP_HW_ACCELERATION,
+                    getattr(cv2, "VIDEO_ACCELERATION_ANY", -1))
+        except Exception:
+            pass
+    return cap
+
+
+def iter_sampled_frames(path: PathLike, target_fps: float, preview_width: int = 256):
+    """Yield ``(video_frame_idx, bgr_image)`` sampled at ``target_fps``.
+
+    Fast path: pipes the video through a bundled FFmpeg, which decodes and scales
+    to ``preview_width`` off the main thread and drops to the target frame rate —
+    this is several times faster than frame-by-frame OpenCV decoding of a long,
+    high-resolution clip. If FFmpeg is unavailable, raises ``RuntimeError`` so the
+    caller can fall back to a pure-OpenCV scanner.
+
+    The yielded frames are BGR (uint8) so they feed the selector unchanged.
+    """
+    from imageio_ffmpeg import get_ffmpeg_exe, get_ffmpeg_version  # raises if absent
+
+    cap = cv2.VideoCapture(str(path))
+    try:
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        cap.release()
+    if src_w <= 0 or src_h <= 0:
+        raise RuntimeError("Could not read video dimensions")
+
+    # Keep aspect ratio; ensure even dimensions (ffmpeg requires it).
+    new_h = int(round(src_h * preview_width / src_w))
+    new_h = (new_h // 2) * 2
+    out_w = (preview_width // 2) * 2
+
+    ff = get_ffmpeg_exe()
+    cmd = [ff, "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-vf", f"fps={target_fps},scale={out_w}:{new_h}",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    frame_size = out_w * new_h * 3
+    buf = bytearray()
+    n = 0
+    try:
+        while True:
+            chunk = proc.stdout.read(1 << 22)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while len(buf) >= frame_size:
+                arr = np.frombuffer(buf[:frame_size], np.uint8).reshape(new_h, out_w, 3).copy()
+                buf = buf[frame_size:]
+                n += 1
+                vidx = round((n - 1) * (src_fps / target_fps))
+                yield vidx, arr
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+
+def iter_sampled_frames_cv2(path: PathLike, target_fps: float, preview_width: int = 256):
+    """Pure-OpenCV fallback for iter_sampled_frames (no FFmpeg dependency)."""
+    cap = open_video_capture(path)
+    if not cap.isOpened():
+        raise IOError(f"Could not open video: {path}")
+    try:
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        new_h = int(round(src_h * preview_width / src_w))
+        new_h = (new_h // 2) * 2
+        out_w = (preview_width // 2) * 2
+        interval = max(1, round(src_fps / target_fps))
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if idx % interval == 0:
+                small = cv2.resize(frame, (out_w, new_h), interpolation=cv2.INTER_AREA)
+                yield idx, small
+            idx += 1
+    finally:
+        cap.release()
+
+
+def sample_frames(path: PathLike, target_fps: float, preview_width: int = 256):
+    """Sample frames at ``target_fps``; prefer FFmpeg, fall back to OpenCV."""
+    try:
+        return iter_sampled_frames(path, target_fps, preview_width)
+    except Exception:
+        return iter_sampled_frames_cv2(path, target_fps, preview_width)
 
 
 # --------------------------------------------------------------------------- #
