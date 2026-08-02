@@ -1,3 +1,11 @@
+import os
+
+# mediapipe's ``drawing_utils`` transitively imports ``matplotlib.pyplot``,
+# whose default backend does an expensive font-cache scan (80+ seconds on a
+# fresh profile). Pin the headless Agg backend so importing mediapipe is fast.
+# Done here, at package import time, *before* mediapipe is ever imported.
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 from .face_detector import MediaPipeFaceDetector, FaceBox, get_default_detector
 from .face_alignment import FaceAligner, AlignmentConfig
 from .frame_extractor import FrameExtractor, FrameExtractionConfig, extract_frames
@@ -27,6 +35,7 @@ from .utils import (
     deblur_frame,
     enhance_frame,
     resize_with_pad,
+    open_video_capture,
 )
 
 __all__ = [
@@ -67,4 +76,5 @@ __all__ = [
     "deblur_frame",
     "enhance_frame",
     "resize_with_pad",
+    "open_video_capture",
 ]

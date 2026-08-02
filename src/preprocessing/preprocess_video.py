@@ -31,7 +31,10 @@ from .face_detector import MediaPipeFaceDetector, FaceBox
 from .frame_extractor import FrameExtractor, FrameExtractionConfig
 from .frame_selection import FrameSelector, FrameSelectionConfig
 from .frame_store import FrameStore, StoreConfig
-from .utils import PathLike, ensure_dir, get_logger, resize_with_pad
+from .utils import (
+    PathLike, ensure_dir, get_logger, open_video_capture, resize_with_pad,
+    sample_frames,
+)
 
 logger = get_logger(__name__)
 
@@ -140,37 +143,28 @@ class VideoPreprocessor:
     # ------------------------------------------------------------------ #
     def _select_representatives(self, video_path: Path) -> list:
         """Stream the video through the FrameSelector and return the list of
-        representative frame indices (positions in the accepted list)."""
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise IOError(f"Could not open video: {video_path}")
-
+        representative frames (sharpest frame per scene)."""
         selector = FrameSelector(self.config.selection_config)
-        source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        interval = max(1, round(source_fps / self.config.frame_extraction.target_fps))
+        target_fps = self.config.frame_extraction.target_fps
+        preview_width = self.config.selection_config.preview_width
 
-        try:
-            frame_idx = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if frame_idx % interval == 0:
-                    selector.push(frame, frame_idx)
-                frame_idx += 1
-        finally:
-            cap.release()
+        n_sampled = 0
+        # sample_frames prefers FFmpeg (fast, hardware-friendly decode + downscale)
+        # and falls back to a pure-OpenCV scanner if FFmpeg is unavailable.
+        for video_frame_idx, small_frame in sample_frames(video_path, target_fps, preview_width):
+            selector.push(small_frame, video_frame_idx)
+            n_sampled += 1
 
         logger.info(
             "%s: %d frames sampled -> %d accepted after dedup -> %d representative scenes",
-            video_path.name, frame_idx, selector.num_accepted,
+            video_path.name, n_sampled, selector.num_accepted,
             len(selector.representatives()),
         )
         return selector.representatives()
 
     def _read_representatives(self, video_path: Path, reps) -> list:
         """Read the actual representative frames back from the video."""
-        cap = cv2.VideoCapture(str(video_path))
+        cap = open_video_capture(video_path)
         frames = []
         try:
             for rep in reps:
@@ -188,7 +182,7 @@ class VideoPreprocessor:
         processed_frames: List[ProcessedFrame] = []
         num_faces = 0
 
-        with FrameStore(store_path) if store_path else _nullcontext() as store:
+        with (FrameStore(store_path, overwrite=True) if store_path else _nullcontext()) as store:
             for i, frame in enumerate(frames):
                 if frame is None:
                     continue

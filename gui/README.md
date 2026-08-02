@@ -24,23 +24,31 @@ python -m gui.app
 
 ## Build a standalone .exe
 
-The exe is self-contained — double-click and run, no Python install needed.
+The app is built as **`--onedir`** (a single `dist\DeepFakeDetectorTester\DeepFakeDetectorTester.exe`
+plus a small `_internal` folder). This is on purpose: a `--onefile` exe packs ~340 MB into itself and
+**re-extracts that archive on every launch (20-30s of waiting)** — unacceptable for a tool you run
+repeatedly. The onedir folder only unpacks once, so **startup is instant** after the first build.
+
+Bundled inside are Mediapipe (~340 MB) and a static FFmpeg binary (~50 MB) used for fast
+hardware-friendly video sampling, so the whole thing runs with no Python install and no internet
+(first run seeds MediaPipe's small model assets into `%LOCALAPPDATA%\DeepFakeDetector\models`).
 
 ```bat
 gui\build_exe.bat
 ```
 
-Output: `dist\DeepFakeDetectorTester.exe` (~340 MB, MediaPipe is bundled).
-MediaPipe model assets (~9 MB) are bundled too, so first run needs no internet.
+Output: `dist\DeepFakeDetectorTester\DeepFakeDetectorTester.exe`
+Requirements: `pip install -r requirements.txt -r requirements-gui.txt`
 
 ### Verify the frozen exe offline
 
 ```bat
-dist\DeepFakeDetectorTester.exe --selftest data\raw\real\testvideo.mp4 out.txt
+dist\DeepFakeDetectorTester\DeepFakeDetectorTester.exe --selftest data\raw\real\testvideo.mp4 out.txt
 ```
 
 prints `OK frames=N faces=M` to `out.txt` (and exits `0`) if the frozen bundle
-is healthy.
+is healthy. Run it twice — the second run is warm because the model assets are
+seeded to `%LOCALAPPDATA%` once.
 
 ## Using the GUI
 

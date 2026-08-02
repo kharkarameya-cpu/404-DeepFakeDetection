@@ -275,6 +275,7 @@ def test_pipeline_config_serialization():
             "temporal_threshold": 0.75,
             "max_scenes": 50,
             "min_scene_frames": 2,
+            "preview_width": 256,
         },
     }
 

@@ -202,6 +202,7 @@ class FrameSelectionConfig:
     temporal_threshold: float = 0.75     # consecutive-frame sim cutoff
     max_scenes: int = 50                 # cap on representative frames per video
     min_scene_frames: int = 2            # ignore 1-frame "scenes" (noise) unless forced
+    preview_width: int = 256             # downscale frames to this width for hashing/features
 
 
 @dataclass
@@ -235,6 +236,11 @@ class FrameSelector:
     def push(self, image: np.ndarray, video_frame_idx: int) -> bool:
         """Process one frame. Returns True if the frame was accepted
         (kept as a scene candidate), False if it was dropped as a duplicate."""
+        # Work on a downscaled preview: hashing, features and the sharpness
+        # check are all O(pixels) but only need coarse detail, so running them
+        # at preview resolution keeps the streaming pass fast on large videos.
+        image = self._downscale(image)
+
         h = dhash(image, self.config.hash_size)
 
         # Dedup: compare against recent frames in the ring window.
@@ -248,6 +254,16 @@ class FrameSelector:
         self._sharpness.append(sharpness(image))
         self._video_indices.append(video_frame_idx)
         return True
+
+    def _downscale(self, image: np.ndarray) -> np.ndarray:
+        import cv2
+
+        w = image.shape[1]
+        if w <= self.config.preview_width:
+            return image
+        hgt = int(image.shape[0] * self.config.preview_width / w)
+        return cv2.resize(image, (self.config.preview_width, hgt),
+                          interpolation=cv2.INTER_AREA)
 
     # ------------------------------------------------------------------ #
     def representatives(self) -> List[SelectedFrame]:
@@ -324,26 +340,14 @@ def select_frames_from_video(
     Frames are sampled at ``target_fps``. The heavy lifting (reading + hashing)
     happens here, but no full-resolution frames are kept in memory.
     """
-    import cv2
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise IOError(f"Could not open video: {video_path}")
+    from .utils import sample_frames
 
     selector = FrameSelector(config or FrameSelectionConfig())
-    try:
-        source_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        interval = max(1, round(source_fps / target_fps))
+    preview_width = (config or FrameSelectionConfig()).preview_width
 
-        frame_idx = 0
-        while frame_idx < max_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % interval == 0:
-                selector.push(frame, frame_idx)
-            frame_idx += 1
-    finally:
-        cap.release()
+    for vidx, small in sample_frames(video_path, target_fps, preview_width):
+        if selector.num_accepted >= max_frames:
+            break
+        selector.push(small, vidx)
 
     return selector.representatives()
