@@ -22,6 +22,12 @@ from src.preprocessing import (
     FaceBox,
     FrameStore,
     StoreConfig,
+    FrameSelector,
+    FrameSelectionConfig,
+    RingBuffer,
+    LSHIndex,
+    dhash,
+    hamming_distance,
 )
 
 
@@ -256,6 +262,20 @@ def test_pipeline_config_serialization():
             "max_frames": 10000,
             "buffer_size": 32,
         },
+        "use_scene_selection": True,
+        "selection_config": {
+            "hash_size": 8,
+            "dedup_hamming": 10,
+            "dedup_window": 64,
+            "feature_dim": 192,
+            "lsh_num_tables": 4,
+            "lsh_num_projections": 8,
+            "lsh_seed": 42,
+            "similarity_threshold": 0.8,
+            "temporal_threshold": 0.75,
+            "max_scenes": 50,
+            "min_scene_frames": 2,
+        },
     }
 
     from dataclasses import asdict
@@ -269,6 +289,112 @@ def test_process_video_nonexistent():
 
 
 # ------------------------------------------------------------------ #
+# Frame selection
+# ------------------------------------------------------------------ #
+
+class TestFrameSelection:
+    """Tests for the RingBuffer → dedup → LSH → scene-graph selector."""
+
+    def test_dhash_and_hamming(self):
+        # Structured images: same image hashes identically, different images differ.
+        base = np.linspace(0, 255, 100).astype(np.uint8)
+        hgrad = np.tile(base, (100, 1))            # rows identical, columns rise
+        vgrad = hgrad.T                            # columns identical, rows rise
+        hgrad3 = np.repeat(hgrad[:, :, None], 3, axis=2)
+        vgrad3 = np.repeat(vgrad[:, :, None], 3, axis=2)
+        h1 = dhash(hgrad3, hash_size=8)
+        assert hamming_distance(h1, dhash(hgrad3, hash_size=8)) == 0
+        assert hamming_distance(h1, dhash(vgrad3, hash_size=8)) > 20
+
+    def test_ring_buffer_eviction(self):
+        rb = RingBuffer(capacity=3)
+        evicted = []
+        for i in range(5):
+            evicted.append(rb.push(i))
+        assert evicted == [None, None, None, 0, 1]  # first three pushed, then oldest evicted
+        assert list(rb) == [2, 3, 4]
+        assert len(rb) == 3
+        assert 3 in rb and 0 not in rb
+
+    def test_lsh_index(self):
+        idx = LSHIndex(dim=8, num_tables=4, num_projections=4)
+        vec = np.zeros(8)
+        idx.insert(0, vec)
+        # A query in the same bucket should return the inserted key.
+        assert 0 in idx.query(np.zeros(8))
+        assert idx.query(np.zeros(8)) == {0}
+
+    def test_static_scene_collapses_to_one_frame(self):
+        """Identical frames should dedup down to a single representative."""
+        cfg = FrameSelectionConfig()
+        selector = FrameSelector(cfg)
+        frame = np.random.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        for i in range(30):
+            selector.push(frame, i)
+        reps = selector.representatives()
+        assert selector.num_accepted == 1
+        assert len(reps) == 1
+        assert reps[0].video_frame_idx == 0
+
+    def test_distinct_scenes_give_distinct_representatives(self):
+        """Three scenes with distinct color + blue-channel structure → three reps."""
+        def make(blue_pattern, g, r):
+            arr = np.zeros((64, 64, 3), dtype=np.uint8)
+            arr[:, :, 0] = np.tile(blue_pattern, (64, 1))  # blue channel: horizontal structure
+            arr[:, :, 1] = g
+            arr[:, :, 2] = r
+            return arr
+
+        w = 64
+        rise = np.linspace(0, 255, w).astype(np.uint8)
+        fall = np.linspace(255, 0, w).astype(np.uint8)
+        tri = np.concatenate([np.linspace(0, 255, w // 2), np.linspace(255, 0, w - w // 2)]).astype(np.uint8)
+        scenes = [
+            make(rise, 100, 0),   # reddish bg + blue ramp up
+            make(fall, 0, 200),   # greenish bg + blue ramp down
+            make(tri, 0, 0),      # blue triangle pattern
+        ]
+        cfg = FrameSelectionConfig()
+        selector = FrameSelector(cfg)
+        idx = 0
+        for s in range(3):
+            for _ in range(6):
+                selector.push(scenes[s], idx)
+                idx += 1
+        reps = selector.representatives()
+        assert len(reps) == 3
+        # Each scene's representative should keep the right video frame index.
+        vids = sorted(r.video_frame_idx for r in reps)
+        assert vids == [0, 6, 12]
+
+    def test_similar_scenes_merge(self):
+        """Near-identical scenes should merge into one representative."""
+        cfg = FrameSelectionConfig()
+        selector = FrameSelector(cfg)
+        base = np.random.randint(0, 256, (256, 256, 3), dtype=np.uint8)
+        for i in range(20):
+            # Tiny per-frame noise keeps frames out of the dedup window but
+            # within the same scene on the coarse 8x8 feature grid.
+            noisy = np.clip(base.astype(np.int16) + np.random.randint(-1, 2, base.shape), 0, 255).astype(np.uint8)
+            selector.push(noisy, i)
+        reps = selector.representatives()
+        assert len(reps) == 1
+
+    def test_pipeline_with_scene_selection_stores_reps_only(self):
+        """Scene selection should store far fewer frames than were sampled."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "scenes.mp4"
+            # 60 frames: 3 distinct scenes of 20 frames each, near-static inside.
+            _create_scene_video(str(video_path), scenes=3, frames_per_scene=20, fps=10)
+            config = PipelineConfig(use_scene_selection=True)
+            result = process_video(str(video_path), str(tmpdir), config=config)
+            h5_path = result.output_dir / f"{result.video_path.stem}.h5"
+            with FrameStore(h5_path) as store:
+                assert store.num_frames == result.num_frames_extracted
+                assert result.num_frames_extracted == 3  # 1 rep per scene
+
+
+# ------------------------------------------------------------------ #
 # Helpers
 # ------------------------------------------------------------------ #
 
@@ -279,4 +405,31 @@ def _create_synthetic_video(path: str, num_frames: int = 10, fps: float = 10.0, 
     for _ in range(num_frames):
         frame = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)
         out.write(frame)
+    out.release()
+
+
+def _create_scene_video(path: str, scenes: int = 3, frames_per_scene: int = 20, fps: float = 10.0,
+                        width: int = 320, height: int = 240):
+    """Create a video with several distinct near-static scenes.
+
+    Each scene has a distinct dominant color AND a distinct horizontal pattern in
+    the blue channel, so perceptual hashing keeps them separate.
+    """
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(path, fourcc, fps, (width, height))
+    w = width
+    rise = np.linspace(0, 255, w).astype(np.uint8)
+    fall = np.linspace(255, 0, w).astype(np.uint8)
+    tri = np.concatenate([np.linspace(0, 255, w // 2), np.linspace(255, 0, w - w // 2)]).astype(np.uint8)
+    patterns = [rise, fall, tri]
+    palette = [(100, 0, 0), (0, 200, 0), (0, 0, 200)]  # BGR: red-ish, green-ish, blue-ish
+    for s in range(scenes):
+        pat = np.tile(patterns[s % len(patterns)], (height, 1))
+        base = palette[s % len(palette)]
+        for _ in range(frames_per_scene):
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+            frame[:, :, 0] = pat
+            frame[:, :, 1] = base[1]
+            frame[:, :, 2] = base[2]
+            out.write(frame)
     out.release()
