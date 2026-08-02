@@ -1,0 +1,2 @@
+# GUI (test harness) build deps — in addition to requirements.txt
+pyinstaller>=6.0

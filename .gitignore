@@ -29,3 +29,8 @@ src/preprocessing/models/*.task
 
 # Docs artifacts
 docs/*.docx
+
+# Build artifacts
+dist/
+build/
+*.spec

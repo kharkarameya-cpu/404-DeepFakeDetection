@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import sys
 from pathlib import Path
 from typing import Union
 
@@ -73,7 +75,26 @@ def list_videos(directory: PathLike, extensions=(".mp4", ".avi", ".mov", ".mkv")
 # and face landmarking) requires downloading small .tflite / .task model
 # files rather than bundling them in the package. This helper caches them
 # locally on first use so subsequent runs don't re-download.
-_MODEL_CACHE_DIR = Path(__file__).resolve().parent / "models"
+#
+# When frozen into an .exe (PyInstaller), ``__file__`` points at the temporary
+# extraction dir, so we keep the cache in a user-writable location instead and
+# seed it from the bundled copy shipped inside the executable.
+def _get_model_cache_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+        return base / "DeepFakeDetector" / "models"
+    return Path(__file__).resolve().parent / "models"
+
+
+def _seed_from_bundle(filename: str, dest: Path) -> bool:
+    """Copy a model that was bundled inside the frozen executable (if any)."""
+    if not getattr(sys, "frozen", False):
+        return False
+    bundled = Path(getattr(sys, "_MEIPASS", "")) / "models" / filename
+    if bundled.exists() and bundled.stat().st_size > 0:
+        shutil.copy2(bundled, dest)
+        return True
+    return False
 
 
 def ensure_model_asset(url: str, filename: str) -> Path:
@@ -86,10 +107,16 @@ def ensure_model_asset(url: str, filename: str) -> Path:
     """
     import urllib.request
 
-    ensure_dir(_MODEL_CACHE_DIR)
-    dest = _MODEL_CACHE_DIR / filename
+    cache_dir = _get_model_cache_dir()
+    ensure_dir(cache_dir)
+    dest = cache_dir / filename
 
     if dest.exists() and dest.stat().st_size > 0:
+        return dest
+
+    if _seed_from_bundle(filename, dest):
+        logger = get_logger("utils.ensure_model_asset")
+        logger.info("Using bundled model asset: %s -> %s", filename, dest)
         return dest
 
     logger = get_logger("utils.ensure_model_asset")
@@ -102,7 +129,7 @@ def ensure_model_asset(url: str, filename: str) -> Path:
         raise RuntimeError(
             f"Failed to download required MediaPipe model asset from {url}. "
             "This requires internet access on first run (models are cached "
-            f"locally afterwards under {_MODEL_CACHE_DIR})."
+            f"locally afterwards under {cache_dir})."
         ) from exc
 
     return dest
