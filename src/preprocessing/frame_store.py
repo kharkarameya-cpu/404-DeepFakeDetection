@@ -50,7 +50,7 @@ else:
 @dataclass
 class StoreConfig:
     compression: str = "gzip"
-    compression_opts: int = 4      # 0 (fast) - 9 (small); 4 is a good balance
+    compression_opts: int = 1      # 0 (fast) - 9 (small); 1 is ~2x faster flush than 4
     chunk_rows: int = 64           # chunk size for frames dataset
     max_frames: int = 10000        # preallocation hint to avoid repeated resizes
     buffer_size: int = 32          # frames/faces buffered in RAM before disk flush

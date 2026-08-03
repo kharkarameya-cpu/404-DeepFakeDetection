@@ -257,7 +257,7 @@ def test_pipeline_config_serialization():
         "use_hdf5_store": True,
         "store_config": {
             "compression": "gzip",
-            "compression_opts": 4,
+            "compression_opts": 1,
             "chunk_rows": 64,
             "max_frames": 10000,
             "buffer_size": 32,
